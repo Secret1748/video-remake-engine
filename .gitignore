@@ -1,0 +1,19 @@
+# render outputs
+out/
+out_*/
+*_montage.jpg
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store
+
+# keep examples/sample.mp4 (committed as a demo), ignore other media dropped in
+/examples/*.mov
+/examples/*.mkv
+/examples/*.webm
