@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 """
 video-remake-engine — turn ONE video into N variants that read as the SAME video to a
-person but that an Instagram-class duplicate detector no longer links to the source.
+person, but where every variant is unlinkable to the source AND to each other on BOTH
+layers an Instagram-class system dedupes on: the video frame-fingerprint (pHash/PDQ) and
+the audio fingerprint (Chromaprint/AcoustID family).
 
-Quality is a first-class constraint: the engine adds NO grain, NO softening, scales with
-the sharpest filter (lanczos), re-encodes visually-losslessly (CRF 16; `--lossless` for
-mathematically lossless), and prefers the one transform that is geometrically LOSSLESS and
-also the strongest perceptual lever — a horizontal mirror — whenever you allow it. It
-reports the measured perceptual distance AND the detail retained for every variant.
+"GREEN" = all N variants, measured on the encoded files, are:
+    * video pHash distance >= threshold vs the source AND vs every other variant, and
+    * audio Chromaprint distance >= threshold vs the source AND vs every other variant.
 
-What actually defeats perceptual duplicate detection (measured, see README):
-  * Robust frame perceptual-hashing (pHash/PDQ — what Meta uses) SURVIVES color, grain,
-    light rotation and speed. Those barely move the hash.
-  * The levers that move a robust frame-hash while staying "the same video" are MIRROR
-    (huge + lossless, but flips on-screen text/logos) and SUBSTANTIAL OFF-CENTER REFRAME.
-  * Color / speed / trim / metadata-strip still matter — they beat the metadata,
-    exact-hash, audio and temporal matchers — just not the frame-hash.
+How it gets there (measure-driven, not assumed):
+    1. SELECT a mutually-distinct SET of framings (direction + zoom, plus a lossless mirror
+       when --allow-mirror) by measuring a candidate grid against the source and pairwise.
+    2. SELECT a mutually-distinct SET of audio settings (subtle pitch + tempo) the same way.
+    3. RENDER each variant = a distinct framing + distinct audio + a distinct colour look;
+       strip all metadata; re-encode visually-lossless (CRF 16; --lossless for qp 0).
+    4. GREEN-GATE: re-measure the encoded files' full pairwise + vs-source matrix on both
+       layers and report GREEN / which variant+layer fell short.
 
-Measure-driven: for each variant it applies a distinct LOOK, escalates the MINIMUM lever
-needed (mirror first when allowed; else just enough off-center reframe) until a real pHash
-can't match it to the source, STOPS, strips all metadata, re-encodes, and re-measures.
+Quality-first: mirror is lossless geometry (100% detail); no grain, no softening; lanczos
+scaling; visually-lossless encode. Reframing a same-res master is the only detail cost and
+is measured + reported (use --target-height with a hi-res master to keep 100%).
 
-Pure stdlib + ffmpeg/ffprobe. Sibling module verify.py does the perceptual scoring.
-
-    python spin.py product.mp4 --out ./out                  # text-safe (no mirror)
-    python spin.py broll.mp4   --out ./out --allow-mirror    # clip has no text -> lossless+strongest
-
-For YOUR content on YOUR channels. See README "Use & ethics".
+Pure stdlib + ffmpeg/ffprobe (+ optional Chromaprint `fpcalc` for the audio layer).
+verify.py does the perceptual scoring. For YOUR content on YOUR channels — see README.
 """
 
 from __future__ import annotations
@@ -39,7 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -48,11 +45,18 @@ import verify  # noqa: E402
 
 DEFAULT_PROFILES = HERE / "profiles.json"
 
-# reframe direction -> unit offset of the crop window within the frame
-DIRS = {
-    "center": (0, 0), "left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1),
-    "ul": (-1, -1), "ur": (1, -1), "dl": (-1, 1), "dr": (1, 1),
-}
+DIRS = {"left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1),
+        "ul": (-1, -1), "ur": (1, -1), "dl": (-1, 1), "dr": (1, 1), "center": (0, 0)}
+DIR_LIST = ["ur", "ul", "dr", "dl", "up", "down", "left", "right"]
+
+# gate (what counts as GREEN on the encoded files). Chromaprint scale: same recording
+# lightly processed ≈ <0.15 differing bits, genuinely different content ≈ 0.40+, so a 0.22
+# pairwise floor is clearly in "not a match" territory.
+V_GATE = 12        # video pHash mean-min distance
+A_GATE = 0.22      # audio chromaprint differing-bits fraction
+# selection targets (higher than the gate, to absorb encode drift)
+V_PICK_SRC, V_PICK_PAIR = 13, 14
+A_PICK_SRC, A_PICK_PAIR = 0.34, 0.26
 
 
 def _f(x: float) -> str:
@@ -102,34 +106,24 @@ def probe(input_path: Path) -> Probe:
 
     duration = float(data.get("format", {}).get("duration") or v.get("duration") or 0.0)
     return Probe(int(v["width"]), int(v["height"]), duration, _fps(v),
-                 a is not None, int(a["sample_rate"]) if a and a.get("sample_rate") else 48000)
+                 a is not None, int(a["sample_rate"]) if a and a.get("sample_rate") else 44100)
 
 
 # --------------------------------------------------------------------------- #
 @dataclass
 class Profile:
+    """A colour 'look' only — distinctness levers (framing, audio) are chosen by the engine."""
     id: int
     name: str
     look: str = ""
-    # look / personality (for your eye; these do NOT meaningfully move a frame-hash)
     hue_deg: float = 0.0
     saturation: float = 1.0
     brightness: float = 0.0
     contrast: float = 1.0
     gamma: float = 1.0
     warmth: float = 0.0
-    sharpen: float = 0.0       # enhancement only; negatives (softening) are clamped to 0
+    sharpen: float = 0.0       # enhancement only; softening (negative) is ignored
     vignette: bool = False
-    # geometry (what actually defeats the frame-hash)
-    reframe: str = "center"
-    base_zoom_pct: float = 6.0
-    prefer_mirror: bool = False
-    # time + audio (defeat the temporal + audio matchers; keep A/V in sync)
-    speed_factor: float = 1.0
-    trim_head_ms: int = 0
-    trim_tail_ms: int = 0
-    audio_semitones: float = 0.0
-    audio_gain_db: float = 0.0
     notes: str = ""
 
     @classmethod
@@ -138,8 +132,23 @@ class Profile:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+NEUTRAL = Profile(0, "neutral")
+
+
+@dataclass
+class Framing:
+    zoom_pct: float
+    mirror: bool
+    reframe: str
+
+
+@dataclass
+class AudioSet:
+    pitch_st: float
+    tempo_pct: float
+
+
 def region_for(zoom_pct: float, W: int, H: int) -> tuple[int, int]:
-    """Source sub-region (a punch-in) for a given zoom. zoom<=0 -> the whole frame."""
     if zoom_pct and zoom_pct > 0:
         z = 1.0 + zoom_pct / 100.0
         return _even(W / z), _even(H / z)
@@ -147,25 +156,20 @@ def region_for(zoom_pct: float, W: int, H: int) -> tuple[int, int]:
 
 
 def detail_pct(zoom_pct: float, W: int, out_w: int) -> float:
-    """Detail retained: 100 = no upscaling. Cropping a region then scaling it to the
-    output only loses detail when the region has fewer pixels than the output."""
     rw, _ = region_for(zoom_pct, W, 100)
     return round(min(100.0, rw / out_w * 100.0), 1)
 
 
-def build_visual_chain(p: Profile, zoom_pct: float, mirror: bool, reframe: str,
-                       W: int, H: int, out_w: int, out_h: int) -> str:
-    """Crop-region (punch-in, never upscales the whole frame) -> mirror -> scale to output
-    with lanczos -> color personality. No setpts. This is exactly what we MEASURE."""
+def build_visual_chain(p: Profile, fr: Framing, W: int, H: int, out_w: int, out_h: int) -> str:
     parts: list[str] = []
-    rw, rh = region_for(zoom_pct, W, H)
+    rw, rh = region_for(fr.zoom_pct, W, H)
     if (rw, rh) != (W, H):
         mx, my = W - rw, H - rh
-        dx, dy = DIRS.get(reframe, (0, 0))
+        dx, dy = DIRS.get(fr.reframe, (0, 0))
         x = min(max(int(round(mx / 2 * (1 + dx * 0.8))), 0), mx)
         y = min(max(int(round(my / 2 * (1 + dy * 0.8))), 0), my)
         parts.append(f"crop={rw}:{rh}:{x}:{y}")
-    if mirror:
+    if fr.mirror:
         parts.append("hflip")
     if (rw, rh) != (out_w, out_h):
         parts.append(f"scale={out_w}:{out_h}:flags=lanczos")
@@ -176,86 +180,124 @@ def build_visual_chain(p: Profile, zoom_pct: float, mirror: bool, reframe: str,
                      f"saturation={_f(p.saturation)}:gamma={_f(p.gamma)}")
     if p.warmth:
         parts.append(f"colorbalance=rm={_f(p.warmth)}:bm={_f(-p.warmth)}")
-    if p.sharpen and p.sharpen > 0:   # enhancement only; never soften (that degrades)
+    if p.sharpen and p.sharpen > 0:
         parts.append(f"unsharp=5:5:{_f(p.sharpen)}:5:5:0")
     if p.vignette:
         parts.append("vignette=PI/5")
     return ",".join(parts) or "null"
 
 
-def build_audio_chain(p: Profile, pr: Probe) -> str:
+def build_audio_chain(a: AudioSet, sr: int) -> str:
+    """Pitch (duration-preserving) + tempo. Tempo also speeds the video (setpts) so A/V stay
+    in sync; here we produce the audio side: net atempo = tempo/pitch ratio."""
+    r = 2.0 ** (a.pitch_st / 12.0) if a.pitch_st else 1.0
+    s = 1.0 + a.tempo_pct / 100.0
     parts: list[str] = []
-    r = 2.0 ** (p.audio_semitones / 12.0) if p.audio_semitones else 1.0
-    tempo = (1.0 / r) * (p.speed_factor or 1.0)
     if r != 1.0:
-        parts.append(f"asetrate={int(round(pr.sample_rate * r))}")
-        parts.append(f"aresample={pr.sample_rate}")
-    if abs(tempo - 1.0) > 1e-6:
-        t = tempo
+        parts.append(f"asetrate={int(round(sr * r))}")
+        parts.append(f"aresample={sr}")
+    factor = s / r
+    if abs(factor - 1.0) > 1e-6:
+        t = factor
         while t > 2.0:
             parts.append("atempo=2.0"); t /= 2.0
         while t < 0.5:
             parts.append("atempo=0.5"); t /= 0.5
         parts.append(f"atempo={_f(t)}")
-    if p.audio_gain_db:
-        parts.append(f"volume={_f(p.audio_gain_db)}dB")
     return ",".join(parts) or "anull"
 
 
 # --------------------------------------------------------------------------- #
-@dataclass
-class Lever:
-    zoom_pct: float
-    mirror: bool
-    reframe: str
-    mean_min: float
-    cleared: bool
+def _maximin_fill(chosen: list, pool: list, dist, n: int) -> None:
+    """Best-effort: fill `chosen` up to n from pool, each pick maximising min-distance."""
+    while len(chosen) < n and pool:
+        best, bi = None, None
+        for i, c in enumerate(pool):
+            m = min((dist(c, k) for k in chosen), default=999)
+            if best is None or m > best:
+                best, bi = m, i
+        chosen.append(pool.pop(bi))
 
 
-def escalate(src_hashes: list[int], source_path: Path, p: Profile, W: int, H: int,
-             out_w: int, out_h: int, mirror_allowed: bool, threshold: int, margin: int) -> Lever:
-    """Find the MINIMUM lever (least human-visible / least lossy first) that clears the
-    detection threshold. Mirror-only is invisible AND geometrically lossless, so it's the
-    first thing tried for mirror-preferring profiles."""
-    base = p.base_zoom_pct
-    if mirror_allowed and p.prefer_mirror:
-        ladder = [(0, True), (base, True), (base + 6, True)]          # mirror-only first = lossless
-    else:
-        ladder = [(base, False), (base + 5, False), (base + 10, False),
-                  (base + 15, False), (base + 20, False), (base + 26, False)]
-        if mirror_allowed:
-            ladder.append((0, True))                                  # lossless last-resort
+def select_framings(source: Path, src_h: list[int], n: int, mirror_allowed: bool,
+                    W: int, H: int, out_w: int, out_h: int, zooms: list[int]) -> list[Framing]:
+    cands: list[Framing] = [Framing(z, False, d) for d in DIR_LIST for z in zooms]
+    if mirror_allowed:
+        cands.append(Framing(0, True, "center"))                       # pure mirror = lossless
+        cands += [Framing(z, True, d) for d in DIR_LIST for z in zooms]
+    H_ = {id(c): verify.frame_hashes(str(source), fps=2.0,
+          pre_vf=build_visual_chain(NEUTRAL, c, W, H, out_w, out_h)) for c in cands}
+    vs_src = {id(c): verify.distance_from(src_h, H_[id(c)]).mean_min for c in cands}
+    pair = lambda a, b: verify.distance_from(H_[id(a)], H_[id(b)]).mean_min
+    # detail-first: prefer the shallowest zoom (and the lossless mirror, zoom 0) that still
+    # separates, so quality stays as high as possible.
+    pool = sorted([c for c in cands if vs_src[id(c)] >= V_PICK_SRC],
+                  key=lambda c: (c.zoom_pct, -vs_src[id(c)]))
+    chosen: list[Framing] = []
+    for c in pool:
+        if all(pair(c, k) >= V_PICK_PAIR for k in chosen):
+            chosen.append(c)
+        if len(chosen) >= n:
+            break
+    if len(chosen) < n:  # best-effort fill (gate will flag any shortfall honestly)
+        rest = [c for c in sorted(cands, key=lambda c: -vs_src[id(c)]) if c not in chosen]
+        _maximin_fill(chosen, rest, pair, n)
+    return chosen[:n]
 
-    best: Lever | None = None
-    for zoom, mirror in ladder:
-        dir_ = p.reframe if (mirror or p.reframe != "center") else "ur"
-        vf = build_visual_chain(p, zoom, mirror, dir_, W, H, out_w, out_h)
-        cand = verify.frame_hashes(str(source_path), fps=2.0, pre_vf=vf)
-        v = verify.distance_from(src_hashes, cand, threshold)
-        lev = Lever(zoom, mirror, dir_, v.mean_min, v.mean_min >= threshold + margin)
-        if best is None or lev.mean_min > best.mean_min:
-            best = lev
-        if lev.cleared:
-            return lev
-    return best  # type: ignore[return-value]
+
+def select_audio(source: Path, n: int, sr: int, pitches: list[float],
+                 tempos: list[float]) -> list[AudioSet]:
+    cands = [AudioSet(p, t) for p in pitches for t in tempos]
+    tmp = HERE / ".audtmp"
+    tmp.mkdir(exist_ok=True)
+    ffmpeg = _require("ffmpeg")
+
+    def render(a: AudioSet) -> list[int] | None:
+        out = tmp / f"a_{a.pitch_st}_{a.tempo_pct}.m4a"
+        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+                        "-vn", "-af", build_audio_chain(a, sr), "-c:a", "aac", "-b:a", "256k",
+                        str(out)], check=True)
+        return verify.chroma_fp(str(out))
+
+    src_fp = verify.chroma_fp(str(source))
+    fps = {id(a): render(a) for a in cands}
+    vs_src = {id(a): (verify.audio_dist_fp(src_fp, fps[id(a)]) or 0.0) for a in cands}
+    pair = lambda a, b: (verify.audio_dist_fp(fps[id(a)], fps[id(b)]) or 0.0)
+    pool = sorted([a for a in cands if vs_src[id(a)] >= A_PICK_SRC], key=lambda a: -vs_src[id(a)])
+    chosen: list[AudioSet] = []
+    for a in pool:
+        if all(pair(a, k) >= A_PICK_PAIR for k in chosen):
+            chosen.append(a)
+        if len(chosen) >= n:
+            break
+    if len(chosen) < n:
+        rest = [a for a in sorted(cands, key=lambda a: -vs_src[id(a)]) if a not in chosen]
+        _maximin_fill(chosen, rest, pair, n)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return chosen[:n]
 
 
 # --------------------------------------------------------------------------- #
 @dataclass
 class Result:
     profile: Profile
+    framing: Framing
+    audio: AudioSet | None
     out_path: Path
-    lever: Lever | None = None
-    cmd: list[str] = None  # type: ignore[assignment]
+    cmd: list[str] = field(default=None)  # type: ignore[assignment]
     ok: bool = False
     error: str = ""
     sha256: str = ""
     size_bytes: int = 0
     duration: float = 0.0
     thumb: str = ""
-    final_mean_min: float = 0.0
-    passed: bool = False
     detail: float = 100.0
+    # green-gate
+    v_src: float = 0.0
+    v_pair: float = 0.0
+    a_src: float | None = None
+    a_pair: float | None = None
+    green: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -267,44 +309,30 @@ def _sha256(path: Path) -> str:
 
 
 def render_one(ffmpeg: str, input_path: Path, out_dir: Path, stem: str, p: Profile,
-               pr: Probe, src_hashes: list[int], out_w: int, out_h: int, mirror_allowed: bool,
-               threshold: int, margin: int, crf: int, lossless: bool, audio_kbps: int,
-               thumbs: bool) -> Result:
+               fr: Framing, au: AudioSet | None, pr: Probe, out_w: int, out_h: int,
+               crf: int, lossless: bool, audio_kbps: int, thumbs: bool) -> Result:
     safe = "".join(c if c.isalnum() else "-" for c in p.name).strip("-").lower()
     out_path = out_dir / f"{stem}__v{p.id:02d}_{safe}.mp4"
-    res = Result(profile=p, out_path=out_path)
+    res = Result(profile=p, framing=fr, audio=au, out_path=out_path)
+    res.detail = detail_pct(fr.zoom_pct, pr.width, out_w)
     try:
-        lever = escalate(src_hashes, input_path, p, pr.width, pr.height, out_w, out_h,
-                         mirror_allowed, threshold, margin)
-        res.lever = lever
-        res.detail = detail_pct(lever.zoom_pct, pr.width, out_w)
+        vchain = build_visual_chain(p, fr, pr.width, pr.height, out_w, out_h)
+        if au and au.tempo_pct:
+            s = 1.0 + au.tempo_pct / 100.0
+            vchain = f"{vchain},setpts={_f(1.0 / s)}*PTS"
 
-        vchain = build_visual_chain(p, lever.zoom_pct, lever.mirror, lever.reframe,
-                                    pr.width, pr.height, out_w, out_h)
-        if p.speed_factor and p.speed_factor != 1.0:
-            vchain = f"{vchain},setpts={_f(1.0 / p.speed_factor)}*PTS"
-
-        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
-        head_s, tail_s = max(0.0, p.trim_head_ms / 1000.0), max(0.0, p.trim_tail_ms / 1000.0)
-        if pr.duration >= 2.0 and (head_s or tail_s):
-            keep = pr.duration - head_s - tail_s
-            if keep >= 0.5 * pr.duration and keep > 0.5:
-                if head_s:
-                    cmd += ["-ss", _f(head_s)]
-                cmd += ["-t", _f(keep)]
-        cmd += ["-i", str(input_path)]
-
-        if pr.has_audio:
-            cmd += ["-filter_complex", f"[0:v]{vchain}[v];[0:a]{build_audio_chain(p, pr)}[a]",
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(input_path)]
+        if pr.has_audio and au is not None:
+            cmd += ["-filter_complex",
+                    f"[0:v]{vchain}[v];[0:a]{build_audio_chain(au, pr.sample_rate)}[a]",
                     "-map", "[v]", "-map", "[a]"]
         else:
             cmd += ["-filter_complex", f"[0:v]{vchain}[v]", "-map", "[v]", "-an"]
-
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
                 "-fflags", "+bitexact", "-flags:v", "+bitexact", "-c:v", "libx264"]
         cmd += (["-qp", "0"] if lossless else ["-crf", str(crf)])
         cmd += ["-preset", "medium", "-pix_fmt", "yuv420p"]
-        if pr.has_audio:
+        if pr.has_audio and au is not None:
             cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k", "-flags:a", "+bitexact"]
         cmd += ["-movflags", "+faststart", str(out_path)]
         res.cmd = cmd
@@ -314,25 +342,18 @@ def render_one(ffmpeg: str, input_path: Path, out_dir: Path, stem: str, p: Profi
             tail = proc.stderr.strip().splitlines()
             res.error = tail[-1] if tail else "ffmpeg failed"
             return res
-
         res.ok = True
         res.sha256 = _sha256(out_path)
         res.size_bytes = out_path.stat().st_size
         op = probe(out_path)
         res.duration = op.duration
-
-        fv = verify.video_distance(str(input_path), str(out_path), threshold=threshold)
-        res.final_mean_min = fv.mean_min
-        res.passed = fv.distinct
-
         if thumbs:
-            tdir = out_dir / "thumbs"
-            tdir.mkdir(exist_ok=True)
+            tdir = out_dir / "thumbs"; tdir.mkdir(exist_ok=True)
             tpath = tdir / f"{out_path.stem}.jpg"
-            tp = subprocess.run(
-                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", _f(op.duration / 2.0),
-                 "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(tpath)],
-                capture_output=True, text=True)
+            tp = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                 "-ss", _f(op.duration / 2.0), "-i", str(out_path),
+                                 "-frames:v", "1", "-q:v", "2", str(tpath)],
+                                capture_output=True, text=True)
             if tp.returncode == 0:
                 res.thumb = str(tpath.relative_to(out_dir))
     except Exception as exc:  # noqa: BLE001
@@ -340,79 +361,101 @@ def render_one(ffmpeg: str, input_path: Path, out_dir: Path, stem: str, p: Profi
     return res
 
 
+def green_gate(source: Path, src_h: list[int], results: list[Result], has_audio: bool) -> None:
+    ok = [r for r in results if r.ok]
+    vh = {r.profile.id: verify.frame_hashes(str(r.out_path), fps=2.0) for r in ok}
+    afp = {r.profile.id: verify.chroma_fp(str(r.out_path)) for r in ok} if has_audio else {}
+    src_fp = verify.chroma_fp(str(source)) if has_audio else None
+    for r in ok:
+        i = r.profile.id
+        r.v_src = verify.distance_from(src_h, vh[i]).mean_min
+        r.v_pair = min((verify.distance_from(vh[i], vh[j.profile.id]).mean_min
+                        for j in ok if j is not r), default=99)
+        v_ok = r.v_src >= V_GATE and r.v_pair >= V_GATE
+        if has_audio and src_fp:
+            r.a_src = verify.audio_dist_fp(src_fp, afp[i])
+            r.a_pair = min((verify.audio_dist_fp(afp[i], afp[j.profile.id]) or 0.0
+                            for j in ok if j is not r), default=1.0)
+            a_ok = (r.a_src or 0) >= A_GATE and (r.a_pair or 0) >= A_GATE
+        else:
+            a_ok = True
+        r.green = bool(v_ok and a_ok)
+
+
 # --------------------------------------------------------------------------- #
 def write_reports(out_dir: Path, stem: str, src: Path, pr: Probe, out_w: int, out_h: int,
-                  results: list[Result], threshold: int, mirror_allowed: bool,
-                  lossless: bool, crf: int) -> None:
+                  results: list[Result], mirror_allowed: bool, lossless: bool, crf: int,
+                  has_audio: bool) -> bool:
     quality = "mathematically lossless (qp 0)" if lossless else f"visually lossless (CRF {crf})"
+    ok = [r for r in results if r.ok]
+    all_green = bool(ok) and all(r.green for r in ok) and len({r.sha256 for r in ok}) == len(ok)
     manifest = {
         "source": str(src), "source_geometry": f"{pr.width}x{pr.height}",
         "output_geometry": f"{out_w}x{out_h}", "encode": quality,
-        "source_duration_s": round(pr.duration, 3), "mirror_allowed": mirror_allowed,
-        "pass_threshold_phash": threshold, "variant_count": len(results),
+        "mirror_allowed": mirror_allowed, "audio_layer": has_audio,
+        "gates": {"video_phash": V_GATE, "audio_chromaprint": A_GATE},
+        "GREEN": all_green, "variant_count": len(results),
         "variants": [{
             "id": r.profile.id, "name": r.profile.name, "look": r.profile.look,
             "file": r.out_path.name if r.ok else None, "ok": r.ok, "error": r.error or None,
-            "sha256": r.sha256 or None, "size_bytes": r.size_bytes or None,
-            "duration_s": round(r.duration, 3) if r.duration else None, "thumb": r.thumb or None,
-            "lever": ({"zoom_pct": r.lever.zoom_pct, "mirror": r.lever.mirror,
-                       "reframe": r.lever.reframe} if r.lever else None),
-            "phash_distance": r.final_mean_min, "passes_detection": r.passed,
-            "detail_retained_pct": r.detail,
-            "ffmpeg_cmd": " ".join(r.cmd) if r.cmd else None,
+            "sha256": r.sha256 or None, "detail_retained_pct": r.detail,
+            "framing": {"zoom_pct": r.framing.zoom_pct, "mirror": r.framing.mirror,
+                        "reframe": r.framing.reframe},
+            "audio": ({"pitch_st": r.audio.pitch_st, "tempo_pct": r.audio.tempo_pct}
+                      if r.audio else None),
+            "video_dist_vs_source": r.v_src, "video_dist_vs_nearest_variant": r.v_pair,
+            "audio_dist_vs_source": r.a_src, "audio_dist_vs_nearest_variant": r.a_pair,
+            "GREEN": r.green, "ffmpeg_cmd": " ".join(r.cmd) if r.cmd else None,
         } for r in results],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
+    banner = "🟢 GREEN — all variants postable as distinct content" if all_green \
+        else "🔴 NOT GREEN — see ⚠️ rows below"
     lines = [
         f"# Variant review — {stem}", "",
-        f"Source `{src}` {pr.width}x{pr.height} · output {out_w}x{out_h} · encode {quality} · "
-        f"mirror {'ALLOWED (clip declared text-free)' if mirror_allowed else 'off (text-safe)'}",
+        f"## {banner}", "",
+        f"Source `{src}` {pr.width}x{pr.height} → output {out_w}x{out_h} · encode {quality} · "
+        f"audio layer {'ON' if has_audio else 'absent'} · mirror {'allowed' if mirror_allowed else 'off'}",
         "",
-        f"`PASS` = a perceptual frame-hash (the family Meta uses) can no longer link the variant "
-        f"to the source (mean-min Hamming ≥ {threshold}). **Detail** = % of original resolution "
-        f"retained (100 = no upscaling; mirror-only and reframes with master headroom stay 100). "
-        f"Eyeball `thumbs/` to confirm each still reads as the same video.",
+        f"Every variant is checked against the source **and every other variant** on both layers a "
+        f"platform dedupes on. **GREEN** needs video pHash ≥ {V_GATE}"
+        f"{' and audio Chromaprint ≥ ' + str(A_GATE) if has_audio else ''} on both vs-source and "
+        f"vs-nearest-variant. `Vsrc`/`Vmin` = video distance to source / nearest variant; "
+        f"`Asrc`/`Amin` = audio distance to source / nearest variant.",
         "",
-        "| # | Profile | Look | Lever | pHash dist | Detection | Detail | File |",
-        "|---|---------|------|-------|-----------|-----------|--------|------|",
+        "| # | Profile | Lever | Detail | Vsrc | Vmin | Asrc | Amin | Status | File |",
+        "|---|---------|-------|--------|------|------|------|------|--------|------|",
     ]
     for r in results:
-        if r.ok:
-            lev = (f"{'mirror' if r.lever and r.lever.mirror else ''}"
-                   f"{' + ' if r.lever and r.lever.mirror and r.lever.zoom_pct else ''}"
-                   f"{(f'{r.lever.zoom_pct:.0f}% ({r.lever.reframe})' if r.lever and r.lever.zoom_pct else '')}"
-                   or "re-encode only")
-            badge = "✅ PASS" if r.passed else "⚠️ still close"
-            lines.append(f"| {r.profile.id:02d} | **{r.profile.name}** | {r.profile.look} | {lev} | "
-                         f"{r.final_mean_min} | {badge} | {r.detail:.0f}% | `{r.out_path.name}` |")
-        else:
-            lines.append(f"| {r.profile.id:02d} | **{r.profile.name}** | {r.profile.look} | — | — | "
-                         f"_FAILED: {r.error}_ | — | — |")
-    ok = [r for r in results if r.ok]
-    passed = sum(1 for r in ok if r.passed)
+        if not r.ok:
+            lines.append(f"| {r.profile.id:02d} | {r.profile.name} | — | — | — | — | — | — | "
+                         f"_FAIL: {r.error}_ | — |"); continue
+        lev = (f"{'mirror' if r.framing.mirror else ''}"
+               f"{'+' if r.framing.mirror and r.framing.zoom_pct else ''}"
+               f"{(f'{r.framing.zoom_pct:.0f}%({r.framing.reframe})' if r.framing.zoom_pct else '')}"
+               or "mirror") + (f" · {r.audio.pitch_st:+.1f}st/{r.audio.tempo_pct:+.0f}%"
+                               if r.audio else "")
+        asrc = f"{r.a_src:.2f}" if r.a_src is not None else "—"
+        amin = f"{r.a_pair:.2f}" if r.a_pair is not None else "—"
+        lines.append(f"| {r.profile.id:02d} | **{r.profile.name}** | {lev} | {r.detail:.0f}% | "
+                     f"{r.v_src:.1f} | {r.v_pair:.1f} | {asrc} | {amin} | "
+                     f"{'✅' if r.green else '⚠️'} | `{r.out_path.name}` |")
+    green_n = sum(1 for r in ok if r.green)
     distinct = len({r.sha256 for r in ok})
     min_detail = min((r.detail for r in ok), default=100)
     lines += [
         "",
-        f"**{len(ok)}/{len(results)} rendered · {distinct} distinct files · "
-        f"{passed}/{len(ok)} clear detection · lowest detail retained {min_detail:.0f}%.**",
-        "",
+        f"**{len(ok)}/{len(results)} rendered · {distinct} byte-distinct · {green_n}/{len(ok)} GREEN · "
+        f"lowest detail {min_detail:.0f}%.**", "",
+        "_Metadata stripped (`-map_metadata -1`, bitexact). File metadata is moot once uploaded "
+        "(platforms re-encode); the distances above are the perceptual layers that actually matter._",
     ]
-    if passed < len(ok) and not mirror_allowed:
-        lines.append("> Some variants stay close because mirror is off. If this clip has **no "
-                     "on-screen text/logo**, re-run with `--allow-mirror` — a mirror is invisible, "
-                     "geometrically lossless, and reliably clears detection.")
-    if min_detail < 100 and not mirror_allowed:
-        lines.append("> Detail < 100% means a reframe upscaled a same-resolution master. To keep "
-                     "100%: supply a higher-resolution master and set `--target-height`, or use "
-                     "`--allow-mirror` on text-free clips.")
-    lines += [
-        "",
-        "_All metadata stripped (`-map_metadata -1`, bitexact). File metadata is moot once uploaded "
-        "(platforms re-encode); detection is on the perceptual fingerprint above._",
-    ]
+    if not has_audio:
+        lines.append("\n> No audio track / `fpcalc` not installed — audio layer skipped. "
+                     "Install Chromaprint (`brew install chromaprint`) to gate audio too.")
     (out_dir / "REVIEW.md").write_text("\n".join(lines) + "\n")
+    return all_green
 
 
 # --------------------------------------------------------------------------- #
@@ -426,24 +469,20 @@ def load_profiles(path: Path) -> list[Profile]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Remake one video into N metadata-stripped, fresh-looking variants that an "
-                    "Instagram-class perceptual matcher no longer links to the source — without "
-                    "degrading quality.")
+        description="Remake one video into N variants that are mutually + vs-source distinct on "
+                    "video AND audio fingerprints — quality preserved.")
     ap.add_argument("input", type=Path)
     ap.add_argument("--out", type=Path, default=Path("./out"))
     ap.add_argument("--profiles", type=Path, default=DEFAULT_PROFILES)
     ap.add_argument("--count", type=int, default=0, help="how many variants (default: all profiles)")
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--allow-mirror", action="store_true",
-                    help="permit horizontal mirror (ONLY for clips with no on-screen text/logo) — "
-                         "invisible, lossless, strongest")
-    ap.add_argument("--crf", type=int, default=16, help="x264 CRF; lower=higher quality (default 16, visually lossless)")
-    ap.add_argument("--lossless", action="store_true", help="mathematically lossless encode (x264 qp 0; large files)")
-    ap.add_argument("--audio-kbps", type=int, default=256, help="AAC bitrate (default 256, transparent)")
+                    help="permit horizontal mirror (ONLY for clips with no on-screen text/logo)")
+    ap.add_argument("--crf", type=int, default=16)
+    ap.add_argument("--lossless", action="store_true")
+    ap.add_argument("--audio-kbps", type=int, default=256)
     ap.add_argument("--target-height", type=int, default=0,
                     help="output height; if < source, reframes consume master headroom losslessly")
-    ap.add_argument("--threshold", type=int, default=verify.PASS_THRESHOLD)
-    ap.add_argument("--margin", type=int, default=2)
     ap.add_argument("--no-thumbs", action="store_true")
     args = ap.parse_args(argv)
 
@@ -454,7 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     profiles = load_profiles(args.profiles)
     if args.count and args.count > 0:
         profiles = profiles[: args.count]
-    if not profiles:
+    n = len(profiles)
+    if not n:
         sys.exit("error: no profiles to render.")
 
     pr = probe(args.input)
@@ -462,43 +502,57 @@ def main(argv: list[str] | None = None) -> int:
     out_w = _even(pr.width * out_h / pr.height)
     args.out.mkdir(parents=True, exist_ok=True)
     stem = args.input.stem
-    jobs = args.jobs or min(os.cpu_count() or 4, len(profiles))
+    jobs = args.jobs or min(os.cpu_count() or 4, n)
+    has_audio = pr.has_audio and verify.have_chromaprint()
 
     enc = "lossless(qp0)" if args.lossless else f"CRF{args.crf}"
-    print(f"remaking {len(profiles)} variants of {args.input.name} "
-          f"({pr.width}x{pr.height} -> {out_w}x{out_h}, {pr.duration:.1f}s) · {jobs} jobs · "
-          f"mirror {'ON' if args.allow_mirror else 'off'} · {enc} · pass≥{args.threshold} pHash")
-    src_hashes = verify.frame_hashes(str(args.input), fps=3.0)
+    print(f"remaking {n} variants of {args.input.name} ({pr.width}x{pr.height} → {out_w}x{out_h}, "
+          f"{pr.duration:.1f}s) · mirror {'ON' if args.allow_mirror else 'off'} · {enc} · "
+          f"audio-layer {'ON' if has_audio else 'off'}")
 
+    print("  selecting mutually-distinct framings…")
+    src_h = verify.frame_hashes(str(args.input), fps=3.0)
+    framings = select_framings(args.input, src_h, n, args.allow_mirror,
+                               pr.width, pr.height, out_w, out_h, zooms=[12, 18, 24, 30])
+    if pr.has_audio and not verify.have_chromaprint():
+        print("  (no fpcalc — audio layer skipped; install Chromaprint to gate audio)")
+    if has_audio:
+        print("  selecting mutually-distinct audio settings…")
+        audios: list[AudioSet | None] = list(select_audio(
+            args.input, n, pr.sample_rate,
+            pitches=[-0.7, -0.5, -0.3, -0.15, 0.15, 0.3, 0.5, 0.7], tempos=[-7, -5, -3, 3, 5, 7]))
+    else:
+        audios = [None] * n
+
+    print(f"  rendering {n} variants ({jobs} jobs)…")
     results: list[Result] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(render_one, ffmpeg, args.input, args.out, stem, p, pr, src_hashes,
-                          out_w, out_h, args.allow_mirror, args.threshold, args.margin,
-                          args.crf, args.lossless, args.audio_kbps, not args.no_thumbs)
-                for p in profiles]
+        futs = [ex.submit(render_one, ffmpeg, args.input, args.out, stem, p, framings[i],
+                          audios[i], pr, out_w, out_h, args.crf, args.lossless,
+                          args.audio_kbps, not args.no_thumbs)
+                for i, p in enumerate(profiles)]
         for fut in concurrent.futures.as_completed(futs):
-            r = fut.result()
-            results.append(r)
-            if r.ok:
-                lev = f"{'mirror' if r.lever and r.lever.mirror else ''}{('+%.0f%%' % r.lever.zoom_pct) if r.lever and r.lever.zoom_pct else ('%.0f%%' % (r.lever.zoom_pct if r.lever else 0))}"
-                print(f"  [{'PASS' if r.passed else 'near'}] v{r.profile.id:02d} "
-                      f"{r.profile.name:<20} dist={r.final_mean_min:<5} detail={r.detail:.0f}% lever={lev}")
-            else:
-                print(f"  [FAIL] v{r.profile.id:02d} {r.profile.name:<20} {r.error}")
-
+            results.append(fut.result())
     results.sort(key=lambda r: r.profile.id)
-    write_reports(args.out, stem, args.input, pr, out_w, out_h, results,
-                  args.threshold, args.allow_mirror, args.lossless, args.crf)
 
+    print("  green-gate: measuring full pairwise + vs-source on both layers…")
+    green_gate(args.input, src_h, results, has_audio)
+    for r in results:
+        if r.ok:
+            a = f" A:{r.a_src:.2f}/{r.a_pair:.2f}" if r.a_src is not None else ""
+            print(f"  {'🟢' if r.green else '🔴'} v{r.profile.id:02d} {r.profile.name:<18} "
+                  f"V:{r.v_src:.1f}/{r.v_pair:.1f}{a} detail={r.detail:.0f}%")
+        else:
+            print(f"  ✗ v{r.profile.id:02d} {r.profile.name:<18} {r.error}")
+
+    all_green = write_reports(args.out, stem, args.input, pr, out_w, out_h, results,
+                              args.allow_mirror, args.lossless, args.crf, has_audio)
     ok = [r for r in results if r.ok]
-    passed = sum(1 for r in ok if r.passed)
-    distinct = len({r.sha256 for r in ok})
-    min_detail = min((r.detail for r in ok), default=100)
-    print(f"\ndone: {len(ok)}/{len(results)} rendered · {distinct} distinct · "
-          f"{passed}/{len(ok)} clear detection · lowest detail {min_detail:.0f}%.")
+    print(f"\n{'🟢 GREEN' if all_green else '🔴 NOT GREEN'}: "
+          f"{sum(1 for r in ok if r.green)}/{len(ok)} variants postable as distinct content.")
     print(f"  review:   {args.out / 'REVIEW.md'}")
     print(f"  manifest: {args.out / 'manifest.json'}")
-    return 0 if ok and passed == len(ok) and distinct == len(ok) else 1
+    return 0 if all_green else 1
 
 
 if __name__ == "__main__":

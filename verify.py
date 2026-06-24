@@ -123,36 +123,42 @@ def video_distance(source: str, variant: str,
     return distance_from(src, var, threshold)
 
 
-def _chromaprint(path: str) -> str | None:
+def have_chromaprint() -> bool:
+    return shutil.which("fpcalc") is not None
+
+
+def chroma_fp(path: str, length: int = 60) -> list[int] | None:
+    """Raw Chromaprint fingerprint (list of 32-bit ints), or None if fpcalc/audio absent."""
     fpcalc = shutil.which("fpcalc")
     if not fpcalc:
         return None
     try:
-        out = subprocess.run([fpcalc, "-raw", "-length", "30", path],
-                             capture_output=True, text=True, timeout=60)
+        out = subprocess.run([fpcalc, "-raw", "-length", str(length), path],
+                             capture_output=True, text=True, timeout=120)
         for line in out.stdout.splitlines():
             if line.startswith("FINGERPRINT="):
-                return line.split("=", 1)[1]
+                vals = [int(x) for x in line.split("=", 1)[1].split(",")
+                        if x.strip().lstrip("-").isdigit()]
+                return vals or None
     except Exception:  # noqa: BLE001
         return None
     return None
 
 
-def audio_distance(source: str, variant: str) -> float | None:
-    """Fraction of differing 32-bit chromaprint sub-fingerprints (0=identical,1=totally different).
-    Returns None if fpcalc/Chromaprint is unavailable or a clip has no audio."""
-    a, b = _chromaprint(source), _chromaprint(variant)
+def audio_dist_fp(a: list[int] | None, b: list[int] | None) -> float | None:
+    """Fraction of differing fingerprint bits (0=identical, 1=totally different)."""
     if not a or not b:
         return None
-    av = [int(x) for x in a.split(",") if x.strip().lstrip("-").isdigit()]
-    bv = [int(x) for x in b.split(",") if x.strip().lstrip("-").isdigit()]
-    if not av or not bv:
-        return None
-    n = min(len(av), len(bv))
+    n = min(len(a), len(b))
     if n == 0:
         return None
-    diff_bits = sum(bin((av[i] ^ bv[i]) & 0xFFFFFFFF).count("1") for i in range(n))
-    return round(diff_bits / (n * 32.0), 4)
+    diff = sum(bin((a[i] ^ b[i]) & 0xFFFFFFFF).count("1") for i in range(n))
+    return round(diff / (n * 32.0), 4)
+
+
+def audio_distance(source: str, variant: str) -> float | None:
+    """Chromaprint distance source<->variant. None if fpcalc/Chromaprint or audio is absent."""
+    return audio_dist_fp(chroma_fp(source), chroma_fp(variant))
 
 
 def main(argv: list[str] | None = None) -> int:
