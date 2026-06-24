@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg + Chromaprint
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libchromaprint-tools
+      - name: Compile
+        run: python -m py_compile spin.py verify.py serve.py
+      - name: Run the engine on the demo clip
+        run: python spin.py examples/real_sample.mp4 --out ./out --allow-mirror
+      - name: Assert GREEN + distinct
+        run: |
+          python - <<'PY'
+          import json
+          m = json.load(open("out/manifest.json"))
+          assert m["GREEN"], "run was not GREEN"
+          ok = [v for v in m["variants"] if v["ok"]]
+          assert len(ok) == 10, f"expected 10 variants, got {len(ok)}"
+          assert len({v["sha256"] for v in ok}) == 10, "variants are not byte-distinct"
+          assert all(v["GREEN"] for v in ok), "a variant was not GREEN"
+          print(f"GREEN: {len(ok)} byte-distinct variants, all pass the video gate")
+          PY

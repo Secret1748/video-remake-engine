@@ -17,3 +17,4 @@ venv/
 /examples/*.mov
 /examples/*.mkv
 /examples/*.webm
+.webruns/

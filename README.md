@@ -1,5 +1,9 @@
 # video-remake-engine
 
+[![ci](https://github.com/Secret1748/video-remake-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Secret1748/video-remake-engine/actions/workflows/ci.yml)
+
+![the drag-and-drop UI](docs/ui.png)
+
 Turn **one** video into **N** variants that read as the *same* video to a person, but where
 **every variant is unlinkable to the source _and_ to each other** on the two layers an
 Instagram-class system dedupes on — the **video frame-fingerprint** (pHash/PDQ) and the
@@ -135,6 +139,18 @@ text/logo (a mirror reads backwards).
 **Exit codes:** `0` = fully GREEN; `1` = a variant fell short on a layer (see `REVIEW.md`) or
 a render failed.
 
+## Drag-and-drop web UI
+
+Prefer not to touch a terminal? Run the bundled local UI — same engine, no extra installs:
+
+```bash
+python3 serve.py            # -> http://127.0.0.1:8000   (--port to change)
+```
+
+Drag a video on, tick *"no on-screen text"* to enable the mirror lever, and it renders the 10
+variants with inline players, download buttons, and the per-variant GREEN badges. Everything
+runs locally — nothing is uploaded anywhere.
+
 ## Outputs (in `--out`)
 
 ```
@@ -183,9 +199,11 @@ python3 verify.py source.mp4 variant.mp4
 
 ```
 spin.py        the engine (CLI)
+serve.py       a local drag-and-drop web UI (stdlib http.server)
 verify.py      pure-Python pHash + Chromaprint perceptual scorer (also a CLI)
 profiles.json  the 10 colour looks
-examples/      a demo clip
+examples/      a demo clip (silent)
+.github/workflows/ci.yml         CI smoke test (asserts the demo renders GREEN)
 .claude/skills/video-variants/   a Claude Code skill that drives it + recommends a pick/drip plan
 ```
 
